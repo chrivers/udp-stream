@@ -16,9 +16,48 @@ use tokio::{
     task::JoinHandle,
 };
 
-const UDP_BUFFER_SIZE: usize = 17480; // 17kb
-                                      // const UDP_TIMEOUT: u64 = 10 * 1000; // 10sec
-const CHANNEL_LEN: usize = 100;
+const DEFAULT_UDP_BUFFER_SIZE: usize = 17480; // 17kb
+                                              // const UDP_TIMEOUT: u64 = 10 * 1000; // 10sec
+const DEFAULT_CHANNEL_LEN: usize = 100;
+
+pub struct UdpListenBuilder {
+    buffer_size: usize,
+    channel_len: usize,
+    socket: UdpSocket,
+}
+
+impl UdpListenBuilder {
+    pub fn new(socket: UdpSocket) -> Self {
+        Self {
+            buffer_size: DEFAULT_UDP_BUFFER_SIZE,
+            channel_len: DEFAULT_CHANNEL_LEN,
+            socket,
+        }
+    }
+
+    pub async fn bind(local_addr: SocketAddr) -> io::Result<Self> {
+        let udp_socket = UdpSocket::bind(local_addr).await?;
+        Ok(Self::new(udp_socket))
+    }
+
+    pub fn with_buffer_size(self, buffer_size: usize) -> Self {
+        Self {
+            buffer_size,
+            ..self
+        }
+    }
+
+    pub fn with_channel_len(self, channel_len: usize) -> Self {
+        Self {
+            channel_len,
+            ..self
+        }
+    }
+
+    pub async fn listen(self) -> io::Result<UdpListener> {
+        UdpListener::listen(self.socket, self.channel_len, self.buffer_size).await
+    }
+}
 
 /// An I/O object representing a UDP socket listening for incoming connections.
 ///
@@ -58,12 +97,18 @@ impl Drop for UdpListener {
 impl UdpListener {
     /// Binds the `UdpListener` to the given local address.
     pub async fn bind(local_addr: SocketAddr) -> io::Result<Self> {
-        let udp_socket = UdpSocket::bind(local_addr).await?;
-        Self::from_tokio(udp_socket).await
+        UdpListenBuilder::bind(local_addr).await?.listen().await
     }
-    /// Creates a `UdpListener` from an existing `tokio::net::UdpSocket`.
-    pub async fn from_tokio(udp_socket: UdpSocket) -> io::Result<Self> {
-        let (tx, rx) = mpsc::channel(CHANNEL_LEN);
+
+    /// Run an `UdpListener` from a given socket (which must be bound before
+    /// calling this function), with a configurable channel length and udp
+    /// buffer size
+    pub async fn listen(
+        udp_socket: UdpSocket,
+        channel_len: usize,
+        udp_buffer_size: usize,
+    ) -> io::Result<Self> {
+        let (tx, rx) = mpsc::channel(channel_len);
         let local_addr = udp_socket.local_addr()?;
 
         let handler = tokio::spawn(async move {
@@ -71,10 +116,10 @@ impl UdpListener {
             let socket = Arc::new(udp_socket);
             let (drop_tx, mut drop_rx) = mpsc::channel(1);
 
-            let mut buf = BytesMut::with_capacity(UDP_BUFFER_SIZE * 3);
+            let mut buf = BytesMut::with_capacity(udp_buffer_size * 3);
             loop {
-                if buf.capacity() < UDP_BUFFER_SIZE {
-                    buf.reserve(UDP_BUFFER_SIZE * 3);
+                if buf.capacity() < udp_buffer_size {
+                    buf.reserve(udp_buffer_size * 3);
                 }
                 select! {
                     Some(peer_addr) = drop_rx.recv() => {
@@ -91,7 +136,7 @@ impl UdpListener {
                                 }
                             }
                             None => {
-                                let (child_tx, child_rx) = mpsc::channel(CHANNEL_LEN);
+                                let (child_tx, child_rx) = mpsc::channel(channel_len);
                                 if let Err(err) = child_tx.send(buf.copy_to_bytes(len)).await {
                                     log::error!("child_tx.send {:?}", err);
                                     continue;
@@ -178,14 +223,26 @@ impl UdpStream {
     /// stream has successfully connected, or it will return an error if one
     /// occurs.
     pub async fn connect(addr: SocketAddr) -> Result<Self, tokio::io::Error> {
+        Self::connect_with_options(addr, DEFAULT_CHANNEL_LEN, DEFAULT_UDP_BUFFER_SIZE).await
+    }
+
+    /// Create a new UDP stream connected to the specified address.
+    ///
+    /// Like `Self::connect`, but allows setting channel length and buffer size options.
+    pub async fn connect_with_options(
+        addr: SocketAddr,
+        channel_len: usize,
+        udp_buffer_size: usize,
+    ) -> Result<Self, tokio::io::Error> {
         let local_addr: SocketAddr = if addr.is_ipv4() {
             SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0)
         } else {
             SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0)
         };
         let socket = UdpSocket::bind(local_addr).await?;
-        Self::from_tokio(socket, addr).await
+        Self::from_tokio_with_options(socket, addr, channel_len, udp_buffer_size).await
     }
+
     /// Creates a new UdpStream from a tokio::net::UdpSocket.
     /// This function is intended to be used to wrap a UDP socket from the tokio library.
     /// Note: The UdpSocket must have the UdpSocket::connect method called before invoking this function.
@@ -193,16 +250,34 @@ impl UdpStream {
         socket: UdpSocket,
         peer_addr: SocketAddr,
     ) -> Result<Self, tokio::io::Error> {
+        Self::from_tokio_with_options(
+            socket,
+            peer_addr,
+            DEFAULT_CHANNEL_LEN,
+            DEFAULT_UDP_BUFFER_SIZE,
+        )
+        .await
+    }
+
+    /// Creates a new UdpStream from a tokio::net::UdpSocket.
+    ///
+    /// Like `Self::from_tokio`, but allows setting channel length and buffer size options.
+    pub async fn from_tokio_with_options(
+        socket: UdpSocket,
+        peer_addr: SocketAddr,
+        channel_len: usize,
+        udp_buffer_size: usize,
+    ) -> Result<Self, tokio::io::Error> {
         let socket = Arc::new(socket);
 
         let local_addr = socket.local_addr()?;
 
-        let (child_tx, child_rx) = mpsc::channel(CHANNEL_LEN);
+        let (child_tx, child_rx) = mpsc::channel(channel_len);
 
         let socket_inner = socket.clone();
 
         let handler = tokio::spawn(async move {
-            let mut buf = BytesMut::with_capacity(UDP_BUFFER_SIZE);
+            let mut buf = BytesMut::with_capacity(udp_buffer_size);
             while let Ok((len, received_addr)) = socket_inner.clone().recv_buf_from(&mut buf).await
             {
                 if received_addr != peer_addr {
@@ -213,8 +288,8 @@ impl UdpStream {
                     break;
                 }
 
-                if buf.capacity() < UDP_BUFFER_SIZE {
-                    buf.reserve(UDP_BUFFER_SIZE * 3);
+                if buf.capacity() < udp_buffer_size {
+                    buf.reserve(udp_buffer_size * 3);
                 }
             }
         });
@@ -233,9 +308,11 @@ impl UdpStream {
     pub fn peer_addr(&self) -> std::io::Result<SocketAddr> {
         Ok(self.peer_addr)
     }
+
     pub fn local_addr(&self) -> std::io::Result<SocketAddr> {
         Ok(self.local_addr)
     }
+
     pub fn shutdown(&self) {
         if let Some(drop) = &self.drop {
             let _ = drop.try_send(self.peer_addr);
