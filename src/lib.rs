@@ -11,7 +11,9 @@ use std::{
 use tokio::{
     io::{AsyncRead, AsyncWrite, ReadBuf},
     net::UdpSocket,
+    select,
     sync::{mpsc, Mutex},
+    task::JoinHandle,
 };
 
 const UDP_BUFFER_SIZE: usize = 17480; // 17kb
@@ -42,7 +44,7 @@ const CHANNEL_LEN: usize = 100;
 /// }
 /// ```
 pub struct UdpListener {
-    handler: tokio::task::JoinHandle<()>,
+    handler: JoinHandle<()>,
     receiver: Arc<Mutex<mpsc::Receiver<(UdpStream, SocketAddr)>>>,
     local_addr: SocketAddr,
 }
@@ -74,7 +76,7 @@ impl UdpListener {
                 if buf.capacity() < UDP_BUFFER_SIZE {
                     buf.reserve(UDP_BUFFER_SIZE * 3);
                 }
-                tokio::select! {
+                select! {
                     Some(peer_addr) = drop_rx.recv() => {
                         streams.remove(&peer_addr);
                     }
@@ -150,8 +152,8 @@ pub struct UdpStream {
     local_addr: SocketAddr,
     peer_addr: SocketAddr,
     receiver: Arc<Mutex<mpsc::Receiver<Bytes>>>,
-    socket: Arc<tokio::net::UdpSocket>,
-    handler: Option<tokio::task::JoinHandle<()>>,
+    socket: Arc<UdpSocket>,
+    handler: Option<JoinHandle<()>>,
     drop: Option<mpsc::Sender<SocketAddr>>,
     remaining: Option<Bytes>,
 }
